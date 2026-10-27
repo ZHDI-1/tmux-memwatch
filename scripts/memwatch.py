@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Notification-only tmux server memory monitor. No third-party dependencies."""
+"""tmux memory alerts and interactive, explicitly selected history cleanup."""
 
 import argparse
 import ctypes
@@ -20,7 +20,7 @@ PREFIX = "@memwatch-"
 STATUS = "@memwatch_status"
 SCRIPT = str(Path(__file__).resolve())
 DEFAULTS = {
-    "enabled": "on", "threshold": "4GiB", "interval": "60",
+    "enabled": "on", "soft-limit": "4GiB", "hard-limit": "8GiB", "interval": "60",
     "reminder": "900", "reset-percent": "75", "top": "5",
     "metric": "auto", "status": "on", "status-append": "on", "banner": "on", "key": "M-m",
 }
@@ -62,7 +62,16 @@ def parse_size(text):
 def config(options):
     result = {key: options.get(PREFIX + key, default)
               for key, default in DEFAULTS.items()}
-    result["threshold"] = parse_size(result["threshold"])
+    # Keep the original threshold option as an alias until explicitly migrated.
+    if PREFIX + "soft-limit" not in options and PREFIX + "threshold" in options:
+        result["soft-limit"] = options[PREFIX + "threshold"]
+    result["soft-limit"] = parse_size(result["soft-limit"])
+    result["hard-limit"] = (parse_size(result["hard-limit"])
+                            if PREFIX + "hard-limit" in options
+                            else result["soft-limit"] * 2)
+    if result["hard-limit"] <= result["soft-limit"]:
+        raise ValueError("hard-limit must be greater than soft-limit")
+    result["threshold"] = result["soft-limit"]  # Legacy Python-facing alias.
     for key in ("interval", "reminder"):
         result[key] = float(result[key])
         if not 0.1 <= result[key] <= 86400:
@@ -149,7 +158,7 @@ class Tmux:
         result = {}
         for line in self.run("show-options", "-g").splitlines():
             key, _, value = line.partition(" ")
-            if key.startswith(PREFIX) or key in (STATUS, "status-right"):
+            if key.startswith(PREFIX) or key in (STATUS, "status-right", "status-right-length"):
                 words = shlex.split(value)
                 result[key] = words[0] if words else ""
         return result
@@ -187,17 +196,25 @@ def state_from(options):
 
 
 def transition(previous, value, cfg, now):
-    warning = value >= cfg["threshold"] or (
-        previous.get("warning", False)
-        and value >= cfg["threshold"] * cfg["reset-percent"] / 100)
-    due = warning and value >= cfg["threshold"] and (
-        not previous.get("warning", False)
-        or now - previous.get("last_alert", 0) >= cfg["reminder"])
-    state = dict(previous, warning=warning, bytes=value, sampled_at=time.time(),
+    before = previous.get("level", "soft" if previous.get("warning") else "normal")
+    reset = cfg["reset-percent"] / 100
+    if value >= cfg["hard-limit"] or (before == "hard" and value >= cfg["hard-limit"] * reset):
+        level = "hard"
+    elif value >= cfg["soft-limit"] or (before != "normal" and value >= cfg["soft-limit"] * reset):
+        level = "soft"
+    else:
+        level = "normal"
+    trigger = cfg["hard-limit"] if level == "hard" else cfg["soft-limit"]
+    last = previous.get("last_" + level + "_alert",
+                        previous.get("last_alert", 0) if level == "soft" else 0)
+    entered = (level == "hard" and before != "hard") or (level == "soft" and before == "normal")
+    due = level != "normal" and value >= trigger and (entered or now - last >= cfg["reminder"])
+    state = dict(previous, warning=level != "normal", level=level, bytes=value, sampled_at=time.time(),
                  error="", checks=previous.get("checks", 0) + 1)
     if due:
         state["last_alert"] = now
-    if not warning:
+        state["last_" + level + "_alert"] = now
+    if level == "normal":
         state["top"] = []
     return state, due
 
@@ -229,18 +246,22 @@ def badge(state, cfg):
     if state.get("error"):
         return "#[fg=yellow]MEM ?#[default]"
     if state.get("warning"):
-        return "#[fg=red,bold]MEM " + size_label(state["bytes"]) + "#[default]"
+        hard = state.get("level") == "hard"
+        style = "red,bold" if hard else "yellow,bold"
+        label = "MEM HARD " if hard else "MEM "
+        return "#[fg=" + style + "]" + label + size_label(state["bytes"]) + "#[default]"
     return ""
 
 
 def notify(tmux, generation, state, cfg, targets=None):
-    if cfg["banner"] == "off":
+    hard = state.get("level") == "hard"
+    if not hard and cfg["banner"] == "off":
         return
     try:
         targets = clients(tmux) if targets is None else targets
     except Unavailable:
         return
-    message = f"tmux memory: {size_label(state.get('bytes', 0))} ({state.get('metric', '?')}); threshold {size_label(cfg['threshold'])}."
+    message = f"tmux memory: {size_label(state.get('bytes', 0))} ({state.get('metric', '?')}); soft limit {size_label(cfg['soft-limit'])}."
     top = state.get("top", [])
     if top:
         message += f" Largest history: {top[0]['pane']} {size_label(top[0]['bytes'])}."
@@ -250,8 +271,13 @@ def notify(tmux, generation, state, cfg, targets=None):
     delay = "10000" if flags else "2000"
     for client in targets:
         try:
-            tmux.guard(generation, [["display-message", *flags, "-d", delay,
-                                     "-c", client, "-l", message]])
+            if hard:
+                command = tmux.invocation("show", "--client", client, "--warning",
+                                          "--server-pid", state["server_pid"])
+                tmux.guard(generation, [["run-shell", "-b", command]])
+            else:
+                tmux.guard(generation, [["display-message", *flags, "-d", delay,
+                                         "-c", client, "-l", message]])
         except Unavailable:
             pass  # A disconnect must not stop the scheduled checks.
 
@@ -273,7 +299,8 @@ def tick(tmux, generation, expected_pid):
         value, metric = memory(expected_pid, cfg["metric"])
         state, due = transition(previous, value, cfg, time.monotonic())
         state["metric"] = metric
-        if due:
+        state["server_pid"] = expected_pid
+        if due and state["level"] == "soft":
             try:
                 state["top"] = panes(tmux)[:cfg["top"]]
             except Unavailable:
@@ -307,9 +334,11 @@ def start(tmux):
               PREFIX + "state": json.dumps(state, separators=(",", ":"))}
     for name, value in DEFAULTS.items():
         if PREFIX + name not in options:
-            values[PREFIX + name] = value
+            values[PREFIX + name] = str(cfg[name]) if name in ("soft-limit", "hard-limit") else value
     if cfg["status"] == "on" and cfg["status-append"] == "on" and "#{" + STATUS + "}" not in options.get("status-right", ""):
         values["status-right"] = options.get("status-right", "") + " #{" + STATUS + "}"
+    if cfg["status"] == "on" and cfg["status-append"] == "on":
+        values["status-right-length"] = max(80, int(options.get("status-right-length", "40")))
     commands = tmux.set_commands(values)
     attached = tmux.invocation("attached", "--client", "#{client_name}")
     hook = shlex.join(["run-shell", "-b", attached])
@@ -335,7 +364,7 @@ def attached(tmux, client):
         notify(tmux, options.get(PREFIX + "generation", ""), state, cfg, [client])
 
 
-def report(tmux, as_json=False, pause=False):
+def report(tmux, as_json=False):
     pid = tmux.identity()
     options = tmux.options()
     cfg = config(options)
@@ -346,19 +375,164 @@ def report(tmux, as_json=False, pause=False):
                              metric=metric, panes=rows), indent=2))
     else:
         print(f"tmux server {pid}: {size_label(value)} [{metric}]")
-        print(f"Threshold: {size_label(cfg['threshold'])}; socket: {clean(tmux.socket)}\n")
+        print(f"Soft: {size_label(cfg['soft-limit'])}; hard: {size_label(cfg['hard-limit'])}; socket: {clean(tmux.socket)}\n")
         print(f"{'PANE':<8} {'GRID':>12} {'LINES':>10}  LOCATION (COMMAND)")
         for row in rows:
             print(f"{row['pane']:<8} {size_label(row['bytes']):>12} {row['lines']:>10,}  {row['label']}")
         print("\nGrid bytes include visible rows and exclude allocator overhead.")
         print("Pane applications use separate memory. Clearing history may not immediately reduce RSS.")
-        print("\nInspect a pane before cleanup. This plugin never clears history or changes history-limit.")
+        print("\nInteractive cleanup: open the popup, type a row number, then Enter.")
+        print("Only explicit selection clears history; history-limit and pane applications are preserved.")
         print("Manual cleanup: tmux -S <socket-above> clear-history -t <pane-id>")
-    if pause:
+
+
+def clear_pane(tmux, expected_pid, pane):
+    if not re.fullmatch(r"%\d+", pane):
+        raise ValueError("invalid pane ID")
+    # Check inside the server, not just before the RPC: a replacement server
+    # could reuse pane IDs while a user is looking at an older report.
+    condition = "#{==:#{pid}," + str(expected_pid) + "}"
+    marker = "memwatch-server-changed"
+    result = tmux.run("if-shell", "-F", condition,
+                      shlex.join(["clear-history", "-t", pane]),
+                      shlex.join(["display-message", "-p", marker]))
+    if marker in result:
+        raise Unavailable("server changed; no history was cleared")
+
+
+def interactive(tmux, expected_pid=None, warning=False):
+    import curses
+
+    if not sys.stdin.isatty():
+        raise Unavailable("interactive report needs a terminal; use report --json")
+    pid = tmux.identity()
+    if expected_pid is not None and pid != expected_pid:
+        raise Unavailable("server changed; open a new report")
+    cfg = config(tmux.options())
+    allow_cleanup = not warning  # An automatic popup must not turn ongoing typing into a clear.
+    rows, value, metric = [], 0, "loading"
+    os.environ.setdefault("ESCDELAY", "25")  # Also works on Python 3.8.
+
+    def run(screen):
+        nonlocal rows, value, metric, cfg, warning
+        curses.raw()  # Ctrl-C is input to ignore, not a signal that closes the UI.
+        screen.keypad(True)
+        screen.timeout(250)
         try:
-            input("\nPress Enter to close. ")
-        except EOFError:
+            curses.curs_set(0)
+        except curses.error:
             pass
+        entry, offset, message = "", 0, ""
+
+        def refresh(reorder):
+            nonlocal rows, value, metric, cfg
+            if tmux.identity() != pid:
+                raise Unavailable("server changed; close and reopen this report")
+            cfg = config(tmux.options())
+            fresh = panes(tmux)
+            value, metric = memory(pid, cfg["metric"])
+            if reorder:
+                rows = fresh
+            else:
+                by_id = {row["pane"]: row for row in fresh}
+                # A clear does not renumber the rows under the user's fingers.
+                rows = [by_id.get(row["pane"], dict(row, closed=True)) for row in rows]
+
+        height, width = screen.getmaxyx()
+        try:
+            screen.addnstr(0, 0, "HARD MEMORY LIMIT WARNING" if warning else "tmux memory - pane histories",
+                           max(0, width - 1), curses.A_BOLD)
+            screen.addnstr(1, 0, "Loading pane histories...", max(0, width - 1))
+        except curses.error:
+            pass
+        screen.refresh()
+        try:
+            refresh(True)
+        except (Unavailable, ValueError) as error:
+            message = clean(error)
+        last_sample = time.monotonic()
+        while True:
+            if time.monotonic() - last_sample >= 2:
+                try:
+                    value, metric = memory(pid, cfg["metric"])
+                    warning = warning or value >= cfg["hard-limit"]
+                except Unavailable as error:
+                    message = clean(error)
+                last_sample = time.monotonic()
+            height, width = screen.getmaxyx()
+            page = max(1, height - 10)
+            offset = min(offset, max(0, len(rows) - page))
+            screen.erase()
+
+            def put(y, text, attr=0):
+                if 0 <= y < height:
+                    try:
+                        screen.addnstr(y, 0, clean(text), max(0, width - 1), attr)
+                    except curses.error:
+                        pass
+
+            title = "HARD MEMORY LIMIT WARNING" if warning else "tmux memory - pane histories"
+            put(0, title, curses.A_BOLD | (curses.A_REVERSE if warning else 0))
+            put(1, f"Server {pid}: {size_label(value)} [{metric}]")
+            put(2, f"Soft {size_label(cfg['soft-limit'])} | Hard {size_label(cfg['hard-limit'])}")
+            put(3, "Numbers clear the ENTIRE selected pane scrollback; visible screen and command stay."
+                if allow_cleanup else "Read-only hard-limit warning. Open prefix + Alt-m separately for cleanup.")
+            put(4, f"{'ROW':>4}  {'PANE':<7} {'GRID':>11} {'LINES':>9}  LOCATION (COMMAND)", curses.A_BOLD)
+            for position, row in enumerate(rows[offset:offset + page], offset):
+                label = "[pane closed]" if row.get("closed") else row["label"]
+                put(5 + position - offset,
+                    f"{position + 1:>4}  {row['pane']:<7} {size_label(row['bytes']):>11} {row['lines']:>9,}  {label}")
+            put(height - 4, "Grid bytes include the visible screen; freed memory may stay in the allocator.")
+            put(height - 3, message)
+            put(height - 2, "q / Esc: close | arrows / PgUp / PgDn: scroll | r: refresh and re-sort")
+            put(height - 1, "Clear row number + Enter: " + entry if allow_cleanup else
+                "Only q or Esc acknowledges this warning. Pane history is unchanged.", curses.A_BOLD)
+            screen.refresh()
+            try:
+                key = screen.get_wch()
+            except curses.error:
+                continue
+            if key in ("q", "\x1b"):
+                return
+            if allow_cleanup and isinstance(key, str) and key.isascii() and key.isdigit():
+                entry = (entry + key)[:8]
+            elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                entry = entry[:-1]
+            elif allow_cleanup and key in ("\n", "\r", curses.KEY_ENTER) and entry:
+                number, entry = int(entry), ""
+                if not 1 <= number <= len(rows):
+                    message = "No such row; nothing cleared."
+                    continue
+                row = rows[number - 1]
+                try:
+                    if row.get("closed"):
+                        raise Unavailable("pane has closed; nothing cleared")
+                    clear_pane(tmux, pid, row["pane"])
+                    message = f"Cleared {row['pane']} scrollback. Row numbers are unchanged."
+                    refresh(False)
+                except (Unavailable, ValueError) as error:
+                    message = clean(error)
+            elif key == "r":
+                entry = ""
+                try:
+                    refresh(True)
+                    message = "Refreshed and re-sorted rows."
+                except (Unavailable, ValueError) as error:
+                    message = clean(error)
+            elif key in (curses.KEY_DOWN, "j"):
+                offset += 1
+            elif key in (curses.KEY_UP, "k"):
+                offset = max(0, offset - 1)
+            elif key == curses.KEY_NPAGE:
+                offset += page
+            elif key == curses.KEY_PPAGE:
+                offset = max(0, offset - page)
+            elif key == curses.KEY_HOME:
+                offset = 0
+            elif key == curses.KEY_END:
+                offset = len(rows)
+
+    curses.wrapper(run)
 
 
 def main():
@@ -375,6 +549,11 @@ def main():
     hook.add_argument("--client", required=True)
     popup = sub.add_parser("show")
     popup.add_argument("--client")
+    popup.add_argument("--warning", action="store_true")
+    popup.add_argument("--server-pid", type=int)
+    ui = sub.add_parser("ui")
+    ui.add_argument("--warning", action="store_true")
+    ui.add_argument("--server-pid", type=int)
     output = sub.add_parser("report")
     output.add_argument("--json", action="store_true")
     output.add_argument("--pause", action="store_true")
@@ -393,14 +572,24 @@ def main():
                                             PREFIX + "generation": uuid.uuid4().hex,
                                             STATUS: ""}))
         elif args.command == "show":
-            tmux.identity()
+            pid = tmux.identity()
+            if args.server_pid is not None and pid != args.server_pid:
+                raise Unavailable("server changed; warning popup cancelled")
             target = args.client or next(iter(clients(tmux)), None)
             if not target:
                 raise Unavailable("no attached client for the popup; use report")
+            child = ["--server-pid", pid]
+            if args.warning:
+                child.append("--warning")
             tmux.run("display-popup", "-E", "-c", target, "-w", "90%", "-h", "80%",
-                     tmux.invocation("report", "--pause"), timeout=None)
+                     tmux.invocation("ui", *child), timeout=None)
+        elif args.command == "ui":
+            interactive(tmux, args.server_pid, args.warning)
         else:
-            report(tmux, args.json, args.pause)
+            if args.pause:
+                interactive(tmux)
+            else:
+                report(tmux, args.json)
     except (Unavailable, ValueError, OSError) as error:
         # Scheduled checks must not open tmux view mode by printing errors.
         if args.command in ("tick", "attached"):

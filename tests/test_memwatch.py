@@ -42,6 +42,83 @@ def server():
                            capture_output=True, timeout=10)
 
 
+@contextlib.contextmanager
+def terminal(tmux, height=40, width=160):
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+    env = dict(os.environ, TERM="xterm-256color")
+    env.pop("TMUX", None)
+    env.pop("TMUX_PANE", None)
+    process = subprocess.Popen([TMUX, "-N", "-S", tmux.socket, "attach-session", "-t", "test"],
+                               stdin=slave, stdout=slave, stderr=slave, env=env)
+    os.close(slave)
+
+    class View:
+        popup = None
+        output = b""
+
+        def pump(self, timeout=0.05):
+            if select.select([master], [], [], timeout)[0]:
+                self.output += os.read(master, 65536)
+
+        def wait(self, predicate, timeout=10):
+            deadline = time.monotonic() + timeout
+            while not predicate():
+                if time.monotonic() > deadline:
+                    raise AssertionError("terminal condition timed out: " + repr(self.output[-600:]))
+                self.pump()
+
+        def read_until(self, text):
+            self.wait(lambda: text in self.output)
+            return self.output
+
+        def send(self, data):
+            os.write(master, data)
+
+        def open(self):
+            self.output = b""
+            self.popup = subprocess.Popen([sys.executable, mw.SCRIPT, "--tmux", TMUX,
+                                           "--socket", tmux.socket, "show", "--client", self.client],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.read_until(b"Clear row number + Enter")
+
+        def close_popup(self, key=b"q"):
+            self.send(key)
+            _, error = self.popup.communicate(timeout=5)
+            if self.popup.returncode:
+                raise AssertionError(error.decode())
+            self.popup = None
+
+    view = View()
+    try:
+        view.wait(lambda: bool(mw.clients(tmux)))
+        view.client = mw.clients(tmux)[0]
+        yield view
+    finally:
+        if view.popup and view.popup.poll() is None:
+            view.popup.kill()
+            view.popup.communicate()
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        os.close(master)
+
+
+def history_writer(tmux, name, lines=3000, columns=120):
+    script = f"import sys,time;sys.stdout.write(('X'*{columns}+'\\n')*{lines}+'MEMWATCH_READY\\n');sys.stdout.flush();time.sleep(120)"
+    pane = tmux.run("new-window", "-d", "-P", "-F", "#{pane_id}", "-t", "test", "-n", name,
+                    sys.executable, "-c", script)
+    deadline = time.monotonic() + 5
+    while "MEMWATCH_READY" not in tmux.run("capture-pane", "-p", "-t", pane):
+        if time.monotonic() > deadline:
+            raise AssertionError("history writer did not finish")
+        time.sleep(0.03)
+    return pane
+
+
 class PolicyTests(unittest.TestCase):
     def test_hysteresis_and_reminders(self):
         cfg = mw.config({"@memwatch-threshold": "4KiB"})
@@ -56,6 +133,48 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(state["warning"])
         state, due = mw.transition(state, 4096, cfg, 1103)
         self.assertTrue(due)  # A new incident alerts immediately.
+
+    def test_hard_escalation_bypasses_soft_reminder_and_has_its_own_hysteresis(self):
+        cfg = mw.config({"@memwatch-soft-limit": "4KiB", "@memwatch-hard-limit": "8KiB"})
+        state, due = mw.transition({}, 4096, cfg, 100)
+        self.assertEqual(state["level"], "soft")
+        self.assertTrue(due)
+        state, due = mw.transition(state, 8192, cfg, 101)
+        self.assertEqual(state["level"], "hard")
+        self.assertTrue(due)
+        state, due = mw.transition(state, 8192, cfg, 102)
+        self.assertFalse(due)
+        state, due = mw.transition(state, 7000, cfg, 1100)
+        self.assertEqual(state["level"], "hard")
+        self.assertFalse(due)  # No new popup while improving below the hard limit.
+        state, _ = mw.transition(state, 5000, cfg, 1101)
+        self.assertEqual(state["level"], "soft")
+        state, _ = mw.transition(state, 3000, cfg, 1102)
+        self.assertEqual(state["level"], "normal")
+
+    def test_limits_validation_and_old_threshold_alias(self):
+        cfg = mw.config({"@memwatch-threshold": "12GiB"})
+        self.assertEqual(cfg["soft-limit"], 12 * 1024**3)
+        self.assertEqual(cfg["hard-limit"], 24 * 1024**3)
+        cfg = mw.config({"@memwatch-threshold": "1B", "@memwatch-soft-limit": "4GiB"})
+        self.assertEqual(cfg["soft-limit"], 4 * 1024**3)
+        with self.assertRaises(ValueError):
+            mw.config({"@memwatch-soft-limit": "8GiB", "@memwatch-hard-limit": "4GiB"})
+
+    def test_hard_popup_is_not_disabled_by_soft_banner_option(self):
+        class Connection:
+            calls = []
+
+            def invocation(self, *args):
+                return " ".join(map(str, args))
+
+            def guard(self, token, commands):
+                self.calls.extend(commands)
+        connection = Connection()
+        mw.notify(connection, "abc", {"level": "hard", "server_pid": 123},
+                  mw.config({"@memwatch-banner": "off"}), ["client1"])
+        self.assertEqual(connection.calls[0][:2], ["run-shell", "-b"])
+        self.assertIn("--warning", connection.calls[0][2])
 
     def test_linux_includes_swap_and_rejects_missing_counters(self):
         self.assertEqual(mw.linux_memory("VmRSS: 1024 kB\nVmSwap: 2048 kB\n"),
@@ -151,7 +270,8 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue(state["warning"])
             self.assertEqual(state["error"], "unreadable")
             self.assertIn("MEM ?", t.options()[mw.STATUS])
-            t.run("set-option", "-g", "@memwatch-threshold", "1TiB")
+            t.run("set-option", "-g", "@memwatch-soft-limit", "1TiB")
+            t.run("set-option", "-g", "@memwatch-hard-limit", "2TiB")
             mw.tick(t, token, t.identity())
             self.assertFalse(mw.state_from(t.options())["warning"])
             self.assertEqual(t.options()[mw.STATUS], "")
@@ -183,51 +303,79 @@ class IntegrationTests(unittest.TestCase):
             mw.start(t)
             self.assertEqual(t.options()["status-right"], "my theme")
 
-    def test_report_popup_opens_and_closes_on_an_attached_terminal(self):
+    def test_popup_ignores_other_keys_and_closes_only_with_q_or_escape(self):
+        with server() as t, terminal(t) as view:
+            mw.start(t)
+            for closing_key in (b"q", b"\x1b"):
+                view.open()
+                view.send(b"a\r\x03\x04\x1a\x1b[B\x1b[A")  # Enter, signals, arrows cannot close it.
+                time.sleep(0.25)
+                self.assertIsNone(view.popup.poll())
+                self.assertIn(b"Grid bytes", view.output)
+                view.close_popup(closing_key)
+
+    def test_popup_clears_only_selected_history_and_keeps_screen_and_process(self):
         with server() as t:
-            master, slave = pty.openpty()
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 160, 0, 0))
-            env = dict(os.environ, TERM="xterm-256color")
-            env.pop("TMUX", None)
-            env.pop("TMUX_PANE", None)
-            attached = subprocess.Popen([TMUX, "-N", "-S", t.socket, "attach-session", "-t", "test"],
-                                        stdin=slave, stdout=slave, stderr=slave, env=env)
-            os.close(slave)
-            popup = None
-            try:
-                deadline = time.monotonic() + 5
-                while not mw.clients(t):
-                    if time.monotonic() > deadline:
-                        self.fail("terminal did not attach")
-                    if select.select([master], [], [], 0.05)[0]:
-                        os.read(master, 65536)
+            big = history_writer(t, "big", columns=120)
+            small = history_writer(t, "small", lines=500, columns=20)
+            other_lines = t.run("display-message", "-p", "-t", small, "#{history_size}")
+            original_pid = t.run("display-message", "-p", "-t", big, "#{pane_pid}")
+            screen = t.run("capture-pane", "-p", "-t", big)
+            with terminal(t) as view:
                 mw.start(t)
-                client = mw.clients(t)[0]
-                popup = subprocess.Popen([sys.executable, mw.SCRIPT, "--tmux", TMUX,
-                                          "--socket", t.socket, "show", "--client", client],
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                output = b""
-                deadline = time.monotonic() + 8
-                while b"Press Enter to close" not in output:
-                    if time.monotonic() > deadline:
-                        self.fail("popup report did not render: " + repr(output[-500:]))
-                    if select.select([master], [], [], 0.1)[0]:
-                        output += os.read(master, 65536)
-                os.write(master, b"\r")
-                _, error = popup.communicate(timeout=5)
-                self.assertEqual(popup.returncode, 0, error.decode())
-                self.assertIn(b"Grid bytes", output)
-            finally:
-                if popup and popup.poll() is None:
-                    popup.kill()
-                    popup.communicate()
-                attached.terminate()
-                try:
-                    attached.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    attached.kill()
-                    attached.wait()
-                os.close(master)
+                view.open()
+                view.send(b"1\r")
+                view.wait(lambda: t.run("display-message", "-p", "-t", big, "#{history_size}") == "0")
+                self.assertEqual(t.run("display-message", "-p", "-t", small, "#{history_size}"), other_lines)
+                self.assertEqual(t.run("display-message", "-p", "-t", big, "#{pane_pid}"), original_pid)
+                self.assertEqual(t.run("capture-pane", "-p", "-t", big), screen)
+                view.send(b"1\r")  # Rows must not silently re-sort after clearing.
+                time.sleep(0.25)
+                self.assertEqual(t.run("display-message", "-p", "-t", small, "#{history_size}"), other_lines)
+                self.assertIsNone(view.popup.poll())
+                view.close_popup()
+
+    def test_multi_digit_selection_and_small_terminal(self):
+        with server() as t:
+            for number in range(11):
+                history_writer(t, "pane" + str(number), lines=150, columns=10 + number * 10)
+            rows = mw.panes(t)
+            target, untouched = rows[9]["pane"], rows[0]["pane"]
+            original = t.run("display-message", "-p", "-t", untouched, "#{history_size}")
+            with terminal(t, height=20, width=90) as view:
+                mw.start(t)
+                view.open()
+                view.send(b"10\r")
+                view.wait(lambda: t.run("display-message", "-p", "-t", target, "#{history_size}") == "0")
+                self.assertEqual(t.run("display-message", "-p", "-t", untouched, "#{history_size}"), original)
+                view.close_popup()
+
+    def test_hard_limit_opens_popup_immediately_after_soft_banner(self):
+        with server() as t, terminal(t) as view:
+            pane = history_writer(t, "keep-during-warning")
+            lines = t.run("display-message", "-p", "-t", pane, "#{history_size}")
+            mw.start(t)
+            token = t.options()["@memwatch-generation"]
+            with patch.object(mw, "memory", return_value=(5 * 1024**3, "test")):
+                mw.tick(t, token, t.identity())
+            self.assertEqual(mw.state_from(t.options())["level"], "soft")
+            with patch.object(mw, "memory", return_value=(9 * 1024**3, "test")):
+                mw.tick(t, token, t.identity())
+            output = view.read_until(b"Only q or Esc acknowledges")
+            self.assertIn(b"HARD MEMORY LIMIT WARNING", output)
+            self.assertEqual(mw.state_from(t.options())["level"], "hard")
+            view.send(b"1\rxyz\x03")
+            time.sleep(0.25)
+            self.assertEqual(t.run("display-message", "-p", "-t", pane, "#{history_size}"), lines)
+            view.send(b"q")
+
+    def test_wrong_server_cannot_clear_reused_pane_id(self):
+        with server() as original, server() as replacement:
+            pane = history_writer(replacement, "keep")
+            before = replacement.run("display-message", "-p", "-t", pane, "#{history_size}")
+            with self.assertRaises(mw.Unavailable):
+                mw.clear_pane(replacement, original.identity(), pane)
+            self.assertEqual(replacement.run("display-message", "-p", "-t", pane, "#{history_size}"), before)
 
     def test_missing_server_cannot_be_started_by_old_callback(self):
         with tempfile.TemporaryDirectory(prefix="memwatch-gone-", dir="/tmp") as directory:
