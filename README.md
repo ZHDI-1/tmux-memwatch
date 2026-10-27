@@ -3,7 +3,7 @@
 Watch the tmux server's memory on macOS and Linux. Get an in-tmux warning and
 inspect the panes holding the most scrollback. Cleanup stays manual.
 
-Requires **tmux 3.2+ and Python 3.9+**. No pip packages, operating-system
+Requires **tmux 3.2+ and Python 3.8+**. No pip packages, operating-system
 services, persistent helper processes, or temporary state files are needed.
 
 ## Install
@@ -139,7 +139,8 @@ Tests cover both native memory adapters, warning hysteresis, reminders, disconne
 reload invalidation, detached timers, unreadable samples, linked windows, and server
 isolation. Integration tests use private temporary socket directories and stop their
 servers in `finally` blocks. They never touch the default server or `/tmp/tmux-<uid>`.
-GitHub Actions runs the suite on macOS and Linux. MIT licensed.
+GitHub Actions runs the suite on Python 3.8 on macOS and Linux, plus Python 3.12
+on both platforms. MIT licensed.
 
 Accounting references: [Apple memory footprint](https://developer.apple.com/videos/play/wwdc2022/10106/),
 [Linux process counters](https://www.kernel.org/doc/html/latest/filesystems/proc.html),
