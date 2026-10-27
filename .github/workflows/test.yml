@@ -5,14 +5,21 @@ permissions:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-22.04
+            python: '3.9'
+          - os: ubuntu-24.04
+            python: '3.12'
+          - os: macos-15
+            python: '3.12'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: ${{ matrix.python }}
       - name: Install tmux
         shell: bash
         run: |

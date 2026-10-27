@@ -398,7 +398,7 @@ def main():
             if not target:
                 raise Unavailable("no attached client for the popup; use report")
             tmux.run("display-popup", "-E", "-c", target, "-w", "90%", "-h", "80%",
-                     "-T", "tmux memory", tmux.invocation("report", "--pause"), timeout=None)
+                     tmux.invocation("report", "--pause"), timeout=None)
         else:
             report(tmux, args.json, args.pause)
     except (Unavailable, ValueError, OSError) as error:
