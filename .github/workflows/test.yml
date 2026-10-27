@@ -1,0 +1,28 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Install tmux
+        shell: bash
+        run: |
+          if ! command -v tmux >/dev/null; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              brew install tmux
+            else
+              sudo apt-get update -qq
+              sudo apt-get install -y tmux
+            fi
+          fi
+      - run: sh -n memwatch.tmux
+      - run: python3 -m unittest discover -s tests -v
